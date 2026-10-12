@@ -2893,6 +2893,13 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
         // head starts no further chunk and the parts finish the ones in flight, so every part ends at the same
         // position and the caller can keep that prefix; the tail keeps reporting each drained chunk
         bool pausing = false, head_done = false;
+        // the head's lead over the tail, in chunks: each hop's two slots let a part run two chunks ahead of the
+        // next, so an unbounded head ends a pause up to 2 * (np - 1) chunks in flight (a 7-card split, 4096-token
+        // chunks: 49K tokens read after the pause was asked for). A cap bounds the drain at about the pipeline's
+        // own depth (np - 1 chunks at steady state) without idling a stage: the head waits for the tail to
+        // consume chunk c - LEAD before it starts chunk c. STRATA_GLM_PREFILL_LEAD: 0 = the old unbounded lead.
+        int lead = np;
+        if (const char* v = getenv("STRATA_GLM_PREFILL_LEAD")) lead = std::max(0, std::atoi(v));
         std::string stage_err;
         const size_t slot = (size_t) Tc * 4 * E;
         const auto fail = [&](std::string e) {
@@ -2975,7 +2982,11 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
         cudaSetDevice(dev_);
         for (int c = 0; c < nc; ++c) {
             {
-                std::lock_guard<std::mutex> lk(mu);
+                std::unique_lock<std::mutex> lk(mu);
+                // the lead cap: chunk c waits for the tail to have consumed chunk c - lead (the tail is part
+                // np - 1, which has consumed chunk c - lead once part np - 2 handed it on, produced[np - 2] > c - lead)
+                if (lead > 0 && c >= lead)
+                    cv.wait(lk, [&] { return produced[(size_t) np - 2] > c - lead || stop || pausing; });
                 if (stop || pausing) break;
             }
             const int T = chunk_len(c);
