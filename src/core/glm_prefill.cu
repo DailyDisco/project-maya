@@ -3155,11 +3155,16 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
     for (Glm5Model* m = split_next_.get(); m != nullptr; m = m->split_next_.get()) Tmax = std::min(Tmax, m->pf_->T);
     const int64_t nn = (int64_t) tokens.size();
     int64_t nchunks = (nn + Tmax - 1) / Tmax;
-    if (split_next_ != nullptr) {
-        // a split pipelines the chunks (part k reads chunk c while part k - 1 reads c + 1), so a prompt in fewer chunks
-        // than parts runs the cards one after the other: it is cut into one chunk per part instead, as long as the
-        // chunks keep STRATA_GLM_PREFILL_MIN_CHUNK tokens (512). A 2K tool turn on seven RTX 3090s: 5.9 s as one
-        // 2048-token chunk, about 3.5 s as four of 512 (the cards' turns overlap); a long prompt keeps its full chunks
+    // STRATA_GLM_PREFILL_SHORT=1 (off by default): a split pipelines the chunks (part k reads chunk c while part k - 1
+    // reads c + 1), so a prompt in fewer chunks than parts runs the cards one after the other. With it on, that prompt
+    // is cut into one chunk per part, as long as the chunks keep STRATA_GLM_PREFILL_MIN_CHUNK tokens (512). A 2K tool
+    // turn on seven RTX 3090s: 6.04 s as one chunk, 4.07 s cut. A long prompt keeps its full chunks. Where a chunk's
+    // time is mostly experts from RAM the cut is slower, which is why it stays off.
+    static const bool short_chunks = [] {
+        const char* v = getenv("STRATA_GLM_PREFILL_SHORT");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    if (short_chunks && split_next_ != nullptr) {
         int np = 1;
         for (Glm5Model* m = split_next_.get(); m != nullptr; m = m->split_next_.get()) ++np;
         static const int64_t min_chunk = [] {
